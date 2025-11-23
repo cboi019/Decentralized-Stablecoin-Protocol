@@ -13,23 +13,23 @@ import {AggregatorV3Interface} from "@chainlink/contracts/src/v0.8/shared/interf
  * @notice Decentralized Stablecoin Engine with collateral-specific debt tracking
  * @dev This protocol implements a novel approach to stablecoin minting where debt is allocated to specific collateral types,
  * preventing protocol insolvency through granular health checks at both user and protocol levels.
- * 
+ *
  * Key Features:
  * - Collateral-specific DSC minting (prevents cross-collateral insolvency)
  * - Dual health checks (user-level and protocol-level)
  * - Liquidation with grace period (120-150% collateralization)
  * - Forward-looking health validation (checks if transaction will break health)
  * - Oracle staleness protection via OracleLib
- * 
+ *
  * The system supports WETH and WBTC as collateral with Chainlink price feeds.
  */
 contract DSCEngine {
     using OracleLib for AggregatorV3Interface;
-    
+
     /*//////////////////////////////////////////////////////////////
                                  ERRORS
     //////////////////////////////////////////////////////////////*/
-    
+
     error DSCEngine__TOKEN_ADDRESSES_AND_PRICE_FEED_ADDRESSES_MUST_BE_SAME_LENGTH();
     error DSCEngine__NOT_ALLOWED_TOKEN();
     error DSCEngine__INPUT_AN_AMOUNT();
@@ -46,41 +46,41 @@ contract DSCEngine {
     /*//////////////////////////////////////////////////////////////
                             STATE VARIABLES
     //////////////////////////////////////////////////////////////*/
-    
+
     /// @notice Array of allowed collateral token addresses
     address[] private s_TOKEN_ADDRESSES;
-    
+
     /// @notice Array of users who have deposited (used for invariant testing)
     address[] private s_USERS;
-    
+
     /// @notice Maximum health threshold (150% = 1.5e18) - below this triggers liquidation eligibility
     uint256 private constant s_MAX_THRESHOLD = 1500000000000000000;
-    
+
     /// @notice Minimum health threshold (120% = 1.2e18) - grace zone between min and max
     uint256 private constant s_MIN_THRESHOLD = 1200000000000000000;
-    
+
     /// @notice Precision for calculations (1e18)
     uint256 private constant s_PRECISION = 1e18;
-    
+
     /// @notice Divisor for calculating half of debtor's balance during liquidation
     uint256 private constant s_HALF_OF_DEBTORS_BALANCE = 2;
 
     /// @notice Tracks which tokens are allowed as collateral
     mapping(address tokenAddreses => bool) private isAllowed;
-    
+
     /// @notice Total DSC minted by each user across all collateral types
     mapping(address user => uint256 mintedDSC) private s_USER_MINTED_DSC;
-    
+
     /// @notice Maps collateral token addresses to their Chainlink price feed addresses
     mapping(address tokenAddress => address priceFeed) private s_TOKEN_AND_PRICE_FEED;
-    
+
     /// @notice Tracks if a user has already deposited (prevents duplicate user entries)
     mapping(address users => bool) private s_ALREADY_FUNDED;
-    
+
     /// @notice Maps user address and collateral token to DSC minted against that specific collateral
     /// @dev This prevents cross-collateral insolvency - DSC is allocated to specific collateral
     mapping(address user => mapping(address token => uint256 mintedDSC)) private s_TOKEN_TO_MINTED_DSC;
-    
+
     /// @notice Maps user address and collateral token to deposited collateral amount
     mapping(address user => mapping(address tokenAddress => uint256 collateral)) private s_USERS_COLLATERAL_BALANCE;
 
@@ -96,9 +96,7 @@ contract DSCEngine {
      * @param _tokenAddress The token address to validate
      */
     modifier onlyAllowedAddress(address _tokenAddress) {
-        if (!isAllowed[_tokenAddress]) {
-            revert DSCEngine__NOT_ALLOWED_TOKEN();
-        }
+        _onlyAllowedAddress(_tokenAddress);
         _;
     }
 
@@ -107,16 +105,14 @@ contract DSCEngine {
      * @param _amount The amount to validate
      */
     modifier noneZero(uint256 _amount) {
-        if (_amount <= 0) {
-            revert DSCEngine__INPUT_AN_AMOUNT();
-        }
+        _noneZero(_amount);
         _;
     }
 
     /*//////////////////////////////////////////////////////////////
                                 EVENTS
     //////////////////////////////////////////////////////////////*/
-    
+
     event CollateralDeposited(address indexed user, address indexed token, uint256 amount);
     event CollateralWithdrawn(address indexed user, address indexed token, uint256 amount);
     event mintedDSC(address indexed user, uint256 amount);
@@ -198,7 +194,7 @@ contract DSCEngine {
         }
 
         // 2) Compute allowed maximum (50% of debt to prevent full liquidation)
-        uint256 maxAllowedToBurn = getUserMintedDscBalance(_debtor) / 2;
+        uint256 maxAllowedToBurn = getTokenToMintedDSC(_debtor, _tokenAddress) / 2;
         if (_dscToBurn > maxAllowedToBurn) {
             revert DSCEngine__CANNOT_BURN_MORE_THAN_HALF_OF_DEBT();
         }
@@ -262,7 +258,7 @@ contract DSCEngine {
      */
     function mintDSC(address _tokenCollateral, uint256 _amount) public noneZero(_amount) {
         (uint256 info,) = getHealth(_tokenCollateral, msg.sender, _amount);
-        
+
         // Check if protocol will remain solvent after minting
         _checkProtocolHealth(_tokenCollateral, 0, _amount);
 
@@ -288,13 +284,13 @@ contract DSCEngine {
         noneZero(_amount)
     {
         s_USERS_COLLATERAL_BALANCE[msg.sender][_tokenAddress] += _amount;
-        
+
         // Track unique users for invariant testing
         if (!s_ALREADY_FUNDED[msg.sender]) {
             s_USERS.push(msg.sender);
             s_ALREADY_FUNDED[msg.sender] = true;
         }
-        
+
         emit CollateralDeposited(msg.sender, _tokenAddress, _amount);
 
         bool success = IERC20(_tokenAddress).transferFrom(msg.sender, address(this), _amount);
@@ -493,7 +489,7 @@ contract DSCEngine {
                     revert DSCEngine__PROTOCOLS_HEALTH_AT_RISK();
                 }
             }
-        } 
+        }
         // Simulating minting scenario
         else if (_DSCAmount > 0) {
             uint256 totalDSCAfterTX = totalDscSupply + _DSCAmount;
@@ -503,10 +499,20 @@ contract DSCEngine {
         }
     }
 
+    function _noneZero(uint256 _amount) internal pure {
+        if (_amount <= 0) revert DSCEngine__INPUT_AN_AMOUNT();
+    }
+
+    function _onlyAllowedAddress(address _tokenAddress) internal view {
+        if (!isAllowed[_tokenAddress]) {
+            revert DSCEngine__NOT_ALLOWED_TOKEN();
+        }
+    }
+
     /*//////////////////////////////////////////////////////////////
                              VIEW FUNCTIONS
     //////////////////////////////////////////////////////////////*/
-    
+
     function getPriceFeed(address _token) public view returns (address) {
         return s_TOKEN_AND_PRICE_FEED[_token];
     }
