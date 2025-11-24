@@ -10,18 +10,15 @@ import {AggregatorV3Interface} from "@chainlink/contracts/src/v0.8/shared/interf
 /**
  * @title DSCEngine
  * @author Charles Onyii
- * @notice Decentralized Stablecoin Engine with collateral-specific debt tracking
- * @dev This protocol implements a novel approach to stablecoin minting where debt is allocated to specific collateral types,
- * preventing protocol insolvency through granular health checks at both user and protocol levels.
+ * @notice Central protocol contract for minting the Defi Stablecoin (DSC) against allowed collateral.
+ * @dev This protocol implements a novel approach where DSC debt is tracked *per collateral token* for each user,
+ * preventing protocol insolvency through granular health checks at both user and system levels.
  *
  * Key Features:
- * - Collateral-specific DSC minting (prevents cross-collateral insolvency)
- * - Dual health checks (user-level and protocol-level)
- * - Liquidation with grace period (120-150% collateralization)
- * - Forward-looking health validation (checks if transaction will break health)
- * - Oracle staleness protection via OracleLib
- *
- * The system supports WETH and WBTC as collateral with Chainlink price feeds.
+ * - Collateral-Specific Debt: Debt is mapped to the specific collateral used, avoiding cross-collateral risk.
+ * - Dual Health Checks: Every risky transaction (mint/withdraw) checks both the user's position health (>150%) and the protocol's global solvency.
+ * - Global Solvency Invariant: Total DSC supply is capped at 80% of the total USD value of all deposited collateral, ensuring a minimum 125% global collateralization ratio.
+ * - Liquidation: Positions below 150% collateralization are eligible for liquidation, with a 120-150% grace zone preventing instant liquidation.
  */
 contract DSCEngine {
     using OracleLib for AggregatorV3Interface;
@@ -30,27 +27,27 @@ contract DSCEngine {
     //                          ERRORS
     //////////////////////////////////////////////////////////////*/
 
-    /// @dev Thrown when the length of collateral tokens and price feed addresses do not match.
+    /// @dev Thrown when the length of collateral tokens and price feed addresses do not match during construction.
     error DSCEngine__TOKEN_ADDRESSES_AND_PRICE_FEED_ADDRESSES_MUST_BE_SAME_LENGTH();
     /// @dev Thrown when a user attempts to use a token not allowed as collateral.
     error DSCEngine__NOT_ALLOWED_TOKEN();
-    /// @dev Thrown when an input amount is zero.
+    /// @dev Thrown when an input amount (collateral or DSC) is zero.
     error DSCEngine__INPUT_AN_AMOUNT();
-    /// @dev Thrown when a user's balance is insufficient for a transaction.
+    /// @dev Thrown when a user's balance is insufficient for a transaction (collateral or DSC).
     error DSCEngine__INSUFFICIENT_BALANCE(uint256 requiredBalance);
     /// @dev Thrown if an external token transfer or operation fails.
     error DSCEngine__TRANSACTION_FAILED();
-    /// @dev Thrown if a transaction would cause the user's health factor to drop below the minimum threshold (120%).
+    /// @dev Thrown if a transaction would cause the user's health factor to drop below the minimum threshold (150% for risky actions, 120% for liquidation).
     error DSCEngine__HEALTH_AT_RISK();
     /// @dev Thrown if a user attempts to mint DSC without depositing any collateral first.
     error DSCEngine__NO_COLLATERAL_DEPOSITED();
-    /// @dev Thrown if a liquidation is attempted on a user whose health factor is already good (> 150%).
+    /// @dev Thrown if a liquidation is attempted on a user whose health factor is already safe (> 150%).
     error DSCEngine__HEALTH_IS_GOOD();
-    /// @dev Thrown if a liquidation is attempted on a user whose health factor is in the grace zone (120% - 150%).
+    /// @dev Thrown if a liquidation is attempted on a user whose health factor is in the grace zone (120% <= HF < 150%).
     error DSCEngine__HEALTH_AT_GRACE_ZONE();
     /// @dev Thrown during liquidation if the liquidator tries to burn more than 50% of the debtor's debt.
     error DSCEngine__CANNOT_BURN_MORE_THAN_HALF_OF_DEBT();
-    /// @dev Thrown if a transaction would cause the total value of collateral to fall below the total DSC supply, risking protocol insolvency.
+    /// @dev Thrown if a transaction would cause the total DSC supply to exceed 80% of the protocol's total collateral value.
     error DSCEngine__PROTOCOLS_HEALTH_AT_RISK();
     /// @dev Thrown when attempting to get a health status for a user with zero debt.
     error DSCEngine__NOT_ENOUGH_DEBT_TO_BURN();
@@ -68,7 +65,7 @@ contract DSCEngine {
     /// @notice Maximum health threshold (150% scaled to 1e18) - below this triggers liquidation eligibility.
     uint256 private constant s_MAX_THRESHOLD = 1500000000000000000; // 1.5e18
 
-    /// @notice Minimum health threshold (120% scaled to 1e18) - the lower bound of the grace zone.
+    /// @notice Minimum health threshold (120% scaled to 1e18) - the lower bound of the grace zone, and minimum requirement for a healthy user.
     uint256 private constant s_MIN_THRESHOLD = 1200000000000000000; // 1.2e18
 
     /// @notice Precision scaler used for fixed-point arithmetic (1e18).
@@ -76,6 +73,10 @@ contract DSCEngine {
 
     /// @notice Divisor for calculating the maximum allowed debt burn during liquidation (2 for 50%).
     uint256 private constant s_HALF_OF_DEBTORS_BALANCE = 2;
+
+    /// @notice Maximum percentage of protocol collateral value that DSC supply can consume (80).
+    /// @dev This enforces a minimum 125% global collateralization ratio (100 / 80 = 1.25).
+    uint256 private constant s_PROTOCOL_COLLATERAL_CAP = 80;
 
     /// @notice Tracks which tokens are allowed as collateral.
     mapping(address tokenAddreses => bool) private isAllowed;
@@ -126,41 +127,50 @@ contract DSCEngine {
     //////////////////////////////////////////////////////////////*/
 
     /// @notice Emitted when a user deposits collateral.
+    /// @param user The address of the user depositing collateral.
+    /// @param token The collateral token address.
+    /// @param amount The amount of collateral deposited.
     event CollateralDeposited(address indexed user, address indexed token, uint256 amount);
+    
     /// @notice Emitted when a user withdraws collateral.
+    /// @param user The address of the user withdrawing collateral.
+    /// @param token The collateral token address.
+    /// @param amount The amount of collateral withdrawn.
     event CollateralWithdrawn(address indexed user, address indexed token, uint256 amount);
+    
     /// @notice Emitted when a user successfully mints DSC.
+    /// @param user The address of the user minting DSC.
+    /// @param amount The amount of DSC minted.
     event mintedDSC(address indexed user, uint256 amount);
+    
     /// @notice Emitted when a user burns DSC to repay debt.
+    /// @param user The address of the user burning DSC.
+    /// @param amount The amount of DSC burned.
     event DSCBurned(address indexed user, uint256 amount);
+    
     /// @notice Emitted after a successful liquidation.
+    /// @param user The address of the debtor who was liquidated.
+    /// @param amount The total amount of collateral seized (including the 10% bonus).
     event liqudated(address indexed user, uint256 amount);
-
-    /// @notice Internal struct for tracking protocol-wide collateral and value.
-    struct DSCData {
-        uint256 totalWethHeld;
-        uint256 totalWbtcHeld;
-        uint256 valueOfTotalWeth;
-        uint256 valueOfTotalWbtc;
-        uint256 accumulatedHoldings;
-    }
 
     /*//////////////////////////////////////////////////////////////
     //                         CONSTRUCTOR
     //////////////////////////////////////////////////////////////*/
 
     /**
-     * @notice Initializes the DSC Engine with collateral tokens and price feeds.
+     * @notice Initializes the DSC Engine with allowed collateral tokens and their respective Chainlink price feeds.
      * @param _tokenAddresses Array of allowed collateral token addresses (e.g., WETH, WBTC).
      * @param _priceFeedAddresses Array of Chainlink price feed addresses corresponding to tokens.
      * @param _dscAddress Address of the DefiStableCoin contract.
      * @dev Token addresses and price feed addresses must be in the same order and length.
      */
-    constructor(address[2] memory _tokenAddresses, address[2] memory _priceFeedAddresses, address _dscAddress) {
+    constructor(address[] memory _tokenAddresses, address[] memory _priceFeedAddresses, address _dscAddress) {
         if (_priceFeedAddresses.length != _tokenAddresses.length) {
             revert DSCEngine__TOKEN_ADDRESSES_AND_PRICE_FEED_ADDRESSES_MUST_BE_SAME_LENGTH();
         }
-        for (uint256 i = 0; i < _tokenAddresses.length; i++) {
+        // Using length of the input array for iteration
+        uint256 len = _tokenAddresses.length;
+        for (uint256 i = 0; i < len; i++) {
             s_TOKEN_AND_PRICE_FEED[_tokenAddresses[i]] = _priceFeedAddresses[i];
             s_TOKEN_ADDRESSES.push(_tokenAddresses[i]);
             isAllowed[_tokenAddresses[i]] = true;
@@ -177,6 +187,8 @@ contract DSCEngine {
      * @param _tokenAddress The collateral token to deposit (WETH or WBTC).
      * @param _collateralAmount Amount of collateral to deposit.
      * @param _dscAmount Amount of DSC to mint against the deposited collateral.
+     * @dev This transaction requires prior approval of collateral transfer via ERC20 `approve`.
+     * @dev Performs dual health checks: user health check (>= 150%) and protocol health check (global collateralization >= 125%).
      */
     function depositCollateralForDSC(address _tokenAddress, uint256 _collateralAmount, uint256 _dscAmount) external {
         depositCollateral(_tokenAddress, _collateralAmount);
@@ -189,6 +201,7 @@ contract DSCEngine {
      * @param _collateralAmount Amount of collateral to redeem.
      * @param _dscAmount Amount of DSC to burn.
      * @dev Burning DSC is performed first to immediately improve the user's health factor before attempting withdrawal.
+     * @dev Withdrawal of collateral requires the position to be at a healthy level (>= 150%) before and after the transaction.
      */
     function redeemCollateralWithDSC(address _tokenAddress, uint256 _collateralAmount, uint256 _dscAmount) external {
         burnDSC(_dscAmount, _tokenAddress);
@@ -200,9 +213,9 @@ contract DSCEngine {
      * @param _tokenAddress The collateral token to seize.
      * @param _debtor The address of the user being liquidated.
      * @param _dscToBurn Amount of DSC the liquidator burns (max 50% of debtor's debt against the collateral).
-     * @dev Liquidation is triggered when the debtor's health is below the maximum threshold (150%).
-     * @dev The liquidator receives a 10% bonus on the seized collateral value.
-     * @dev The liquidator's health factor is checked *after* the liquidation to ensure they remain healthy.
+     * @dev Liquidation criteria: Debtor's health must be < 150%. Cannot liquidate if health is between 120% and 150% (grace zone).
+     * @dev Liquidator receives a 10% bonus on the value of the seized collateral.
+     * @dev The liquidator's own health factor is checked *after* receiving the bonus collateral to ensure they are not abusing the system.
      */
     function liquidate(address _tokenAddress, address _debtor, uint256 _dscToBurn)
         external
@@ -233,14 +246,15 @@ contract DSCEngine {
 
         uint256 priceScaled = uint256(answer) * 1e10; // Scale to 1e18
 
-        // 5) Calculate collateral to seize based on DSC amount
+        // 5) Calculate collateral to seize based on DSC amount (CollateralValue = DSC * Price)
         // collateralToSeize = (DSC_to_Burn * 1e18) / Price_Scaled
         uint256 collateralToSeize = (_dscToBurn * s_PRECISION) / priceScaled;
 
         // 6) Add 10% liquidation bonus (CollateralToSeize * 1.1)
         uint256 bonus;
         unchecked {
-            bonus = (collateralToSeize * 10) / 100;
+            // Unchecked here is safe as the values are small and are multiplied by 10/100
+            bonus = (collateralToSeize * 10) / 100; 
         }
         uint256 totalSeize = collateralToSeize + bonus;
 
@@ -279,15 +293,16 @@ contract DSCEngine {
      * @param _tokenCollateral The collateral token this DSC debt will be mapped to (e.g., WETH).
      * @param _amount Amount of DSC to mint.
      * @dev Performs a **forward-looking** health check: validates the user's health factor *after* the minting.
-     * @dev Also checks **protocol-level** health to prevent total DSC supply from exceeding total collateral value.
+     * @dev Reverts if the user's post-mint health is < 150% (s_MAX_THRESHOLD).
+     * @dev Also checks **protocol-level** health to prevent total DSC supply from exceeding the 80% collateral cap.
      */
     function mintDSC(address _tokenCollateral, uint256 _amount) public noneZero(_amount) {
         // Calculate user health factor if this new debt is added
         (uint256 userInfo,) = _getHealth(_tokenCollateral, msg.sender, _amount);
 
-        // Check if protocol will remain solvent after minting (Total Collateral Value >= Total DSC Supply + _amount)
+        // Check if protocol will remain solvent after minting (Total Collateral Value >= 125% * Total DSC Supply)
         _checkProtocolHealth(_tokenCollateral, 0, _amount);
-        
+
         // Revert if the user's health factor after minting is below the minimum threshold
         _revertAfterUserHealthCheck(userInfo, "");
 
@@ -302,6 +317,7 @@ contract DSCEngine {
      * @param _tokenAddress The collateral token to deposit.
      * @param _amount Amount of collateral to deposit.
      * @dev Requires the user to approve this contract to transfer tokens beforehand (ERC20 `transferFrom`).
+     * @dev Tracks unique users for protocol invariant checks.
      */
     function depositCollateral(address _tokenAddress, uint256 _amount)
         public
@@ -328,9 +344,8 @@ contract DSCEngine {
      * @notice Withdraws a portion of the user's deposited collateral.
      * @param _tokenAddress The collateral token to withdraw.
      * @param _amount Amount of collateral to withdraw.
-     * @dev Performs both current health check and a **forward-looking** health check to ensure
-     * the withdrawal does not put the user's position at risk (below 120%).
-     * @dev Also checks protocol health before allowing the withdrawal.
+     * @dev Requires the user's position to be at least 150% collateralized *before* and *after* the withdrawal.
+     * @dev Also performs a protocol health check to ensure the withdrawal does not violate the global 125% collateralization invariant.
      */
     function redeemCollateral(address _tokenAddress, uint256 _amount)
         public
@@ -342,20 +357,20 @@ contract DSCEngine {
             revert DSCEngine__INSUFFICIENT_BALANCE(_amount);
         }
 
-        // Check if withdrawal will break protocol health (Total Collateral Value >= Total DSC Supply)
+        // Check if withdrawal will break protocol health (Total Collateral Value >= 125% * Total DSC Supply)
         _checkProtocolHealth(_tokenAddress, _amount, 0);
 
         (uint256 totalDSCMinted, uint256 totalCollateralValue) = getUserAccountInfo(_tokenAddress, msg.sender);
 
         if (totalDSCMinted > 0) {
-            // Check current health (must be >= 150%)
+            // Check current health (must be >= 150% to withdraw collateral)
             uint256 userThreshold = (totalCollateralValue * s_PRECISION) / totalDSCMinted;
             _revertAfterUserHealthCheck(userThreshold, "");
 
             // Check health after withdrawal (forward-looking check)
             uint256 valueToRedeem = getCollateralValue(getPriceFeed(_tokenAddress), _amount);
             uint256 collateralAfterRedeem = totalCollateralValue - valueToRedeem;
-            
+
             // Health Factor = (Collateral Value After Redeem * 1e18) / Total DSC Debt
             uint256 healthAfterRedeem = (collateralAfterRedeem * s_PRECISION) / totalDSCMinted;
             _revertAfterUserHealthCheck(healthAfterRedeem, "");
@@ -374,7 +389,7 @@ contract DSCEngine {
      * @notice Burns DSC to reduce debt against a specific collateral token.
      * @param _amount Amount of DSC to burn.
      * @param _token The collateral token this DSC debt is allocated to.
-     * @dev The debt must be repaid against the specific collateral it was minted for.
+     * @dev The debt must be repaid against the specific collateral it was minted for (collateral-specific debt repayment).
      */
     function burnDSC(uint256 _amount, address _token) public noneZero(_amount) {
         uint256 dscBalance = getTokenToMintedDSC(msg.sender, _token);
@@ -404,10 +419,10 @@ contract DSCEngine {
     {
         (uint256 totalDSCMinted, uint256 totalCollateralValue) = getUserAccountInfo(_tokenCollateral, _user);
         if (totalDSCMinted == 0) revert DSCEngine__NOT_ENOUGH_DEBT_TO_BURN();
-        
+
         // Health Factor = (Total Collateral Value * 1e18) / Total DSC Debt
         uint256 userInfo = (totalCollateralValue * s_PRECISION) / totalDSCMinted;
-        
+
         (, string memory healthStatus) = _getHealthStatus(userInfo);
         return (userInfo, healthStatus);
     }
@@ -436,13 +451,13 @@ contract DSCEngine {
      * @param _priceFeedAddress Chainlink price feed address for the collateral.
      * @param _amount Amount of collateral tokens.
      * @return USD value scaled to 1e18.
-     * @dev Utilizes `OracleLib` for a robust price fetch with staleness checks.
+     * @dev Utilizes `OracleLib.roundDataStaleCheck()` for a robust price fetch with staleness checks, ensuring safety.
      */
     function getCollateralValue(address _priceFeedAddress, uint256 _amount) public view returns (uint256) {
         AggregatorV3Interface priceFeed = AggregatorV3Interface(_priceFeedAddress);
         // Uses OracleLib's roundDataStaleCheck to ensure fresh price
         (, int256 answer,,,) = priceFeed.roundDataStaleCheck();
-        
+
         // Value = (Price * Amount) / 1e18 (since price is scaled to 1e10 internally, and Amount is 1e18)
         return ((uint256(answer) * 1e10) * _amount) / s_PRECISION;
     }
@@ -456,56 +471,48 @@ contract DSCEngine {
      * @param _tokenAddress The collateral token involved in the transaction.
      * @param _tokenAmount Amount of collateral being withdrawn (0 if minting).
      * @param _DSCAmount Amount of DSC being minted (0 if withdrawing).
-     * @dev Enforces the global invariant: Total Collateral Value (USD) >= Total DSC Supply.
-     * @dev Checks the state *after* the proposed transaction.
+     * @dev Enforces the global invariant: Total Collateral Value (USD) >= 125% * Total DSC Supply.
+     * @dev This is achieved by capping total DSC supply at 80% (s_PROTOCOL_COLLATERAL_CAP) of the protocol's total collateral value.
      */
     function _checkProtocolHealth(address _tokenAddress, uint256 _tokenAmount, uint256 _DSCAmount) internal view {
-        address wethTokenAddress = getTokenAddress(0);
-        address wbtcTokenAddress = getTokenAddress(1);
-        address wethPriceFeedAddress = getPriceFeed(wethTokenAddress);
-        address wbthPriceFeedAddress = getPriceFeed(wbtcTokenAddress);
         uint256 totalDscSupply = i_DSC.totalSupply();
-        DSCData memory dscData = _checkDSCData();
+        uint256 protocolAccumulatedHoldings = _checkDSCData();
 
-        // Simulating withdrawal scenario
-        if (_DSCAmount == 0) {
-            if (_tokenAddress == wethTokenAddress) {
-                uint256 valueOfWethToRedeem = getCollateralValue(wethPriceFeedAddress, _tokenAmount);
-                uint256 totalWethAfterTx = dscData.valueOfTotalWeth - valueOfWethToRedeem;
-                uint256 accumulatedHoldingsAfterTx1 = totalWethAfterTx + dscData.valueOfTotalWbtc;
-                
-                // Check if total collateral value remains greater than total DSC supply
-                if (accumulatedHoldingsAfterTx1 < totalDscSupply) {
-                    revert DSCEngine__PROTOCOLS_HEALTH_AT_RISK();
-                }
-            }
-
-            if (_tokenAddress == wbtcTokenAddress) {
-                uint256 valueOfWbtcToRedeem = getCollateralValue(wbthPriceFeedAddress, _tokenAmount);
-                uint256 totalWbtcAfterTx = dscData.valueOfTotalWbtc - valueOfWbtcToRedeem;
-                uint256 accumulatedHoldingsAfterTx2 = totalWbtcAfterTx + dscData.valueOfTotalWeth;
-                
-                // Check if total collateral value remains greater than total DSC supply
-                if (accumulatedHoldingsAfterTx2 < totalDscSupply) {
-                    revert DSCEngine__PROTOCOLS_HEALTH_AT_RISK();
-                }
-            }
+        uint256 totalDSCAfterTX;
+        uint256 accumulatedHoldingsAfterTx;
+        
+        if (_DSCAmount > 0) {
+            // Simulating minting scenario
+            totalDSCAfterTX = totalDscSupply + _DSCAmount;
+            accumulatedHoldingsAfterTx = protocolAccumulatedHoldings; // Holdings don't change on mint
+        } else if (_tokenAmount > 0) {
+            // Simulating withdrawal scenario
+            uint256 valueOfTokenToRedeem = getCollateralValue(getPriceFeed(_tokenAddress), _tokenAmount);
+            // This subtraction is safe because the user already checked they have enough collateral
+            accumulatedHoldingsAfterTx = protocolAccumulatedHoldings - valueOfTokenToRedeem; 
+            totalDSCAfterTX = totalDscSupply; // Supply doesn't change on withdraw
+        } else {
+            // Default to current state if no change is simulated
+            totalDSCAfterTX = totalDscSupply;
+            accumulatedHoldingsAfterTx = protocolAccumulatedHoldings;
         }
-        // Simulating minting scenario
-        else if (_DSCAmount > 0) {
-            uint256 totalDSCAfterTX = totalDscSupply + _DSCAmount;
-            
-            // Check if total collateral value is still greater than total DSC supply after mint
-            if (totalDSCAfterTX > dscData.accumulatedHoldings) {
-                revert DSCEngine__PROTOCOLS_HEALTH_AT_RISK();
-            }
+
+        // Calculate the maximum allowed DSC supply based on the remaining collateral value (80% of holdings).
+        // Max DSC Allowed = (Total Collateral Value * 80) / 100
+        uint256 holdingsCap = (accumulatedHoldingsAfterTx * s_PROTOCOL_COLLATERAL_CAP) / 100;
+
+        if (totalDSCAfterTX > holdingsCap) {
+            revert DSCEngine__PROTOCOLS_HEALTH_AT_RISK();
         }
     }
+
 
     /**
      * @notice Reverts the transaction based on the user's health factor, used for both forward-looking checks and liquidation eligibility.
      * @param _userInfo The calculated health factor (0 if checking status only, e.g., during liquidation start).
      * @param _status The human-readable status string (used for liquidation check).
+     * @dev If `_userInfo` is non-zero (risky operation like mint/withdraw), it checks if health is >= 150%.
+     * @dev If `_userInfo` is zero (liquidation), it checks if the debtor is in the "Risk!!!" zone (< 120%).
      */
     function _revertAfterUserHealthCheck(uint256 _userInfo, string memory _status) internal pure {
         // User Health Futuristic Check (Redeem Collateral, Mint)
@@ -514,12 +521,12 @@ contract DSCEngine {
             (bytes32 encodedInfo,) = _getHealthStatus(_userInfo);
             // Must be 'Good!!!' (>= 150%) to proceed with a risky transaction (mint/redeem collateral)
             if (encodedInfo != _statusString("Good!!!")) revert DSCEngine__HEALTH_AT_RISK();
-        } 
+        }
         // Liquidation Eligibility Check
         // If _userInfo is 0, we are checking the *current* status for liquidation
         else if (_userInfo == 0) {
             bytes32 encodedStatus = _statusString(_status);
-            // Cannot liquidate if good
+            // Cannot liquidate if good (>= 150%)
             if (encodedStatus == _statusString("Good!!!")) revert DSCEngine__HEALTH_IS_GOOD();
             // Cannot liquidate if in grace zone (120% - 150%)
             if (encodedStatus == _statusString("Warning!!!")) revert DSCEngine__HEALTH_AT_GRACE_ZONE();
@@ -527,21 +534,29 @@ contract DSCEngine {
     }
 
     /**
-     * @notice Gathers the total collateral held and its USD value for the entire protocol.
-     * @return DSCData The struct containing protocol-wide collateral data.
+     * @notice Calculates the total USD value of all collateral held by the protocol.
+     * @dev This function iterates through all allowed collateral tokens to sum up the USD value of protocol holdings.
+     * @dev Uses a gas-optimized `unchecked` loop with `uint8` for length caching, leveraging the architectural constraint of max 255 tokens.
+     * @return protocolAccumulatedHoldings Total USD value of all collateral.
      */
-    function _checkDSCData() internal view returns (DSCData memory) {
-        uint256 wethHeld = IERC20(getTokenAddress(0)).balanceOf(address(this));
-        uint256 wbtcHeld = IERC20(getTokenAddress(1)).balanceOf(address(this));
-        uint256 valueOfWethHeld = getCollateralValue(getPriceFeed(getTokenAddress(0)), wethHeld);
-        uint256 valueOfWbtcHeld = getCollateralValue(getPriceFeed(getTokenAddress(1)), wbtcHeld);
-        return DSCData({
-            totalWethHeld: wethHeld,
-            totalWbtcHeld: wbtcHeld,
-            valueOfTotalWeth: valueOfWethHeld,
-            valueOfTotalWbtc: valueOfWbtcHeld,
-            accumulatedHoldings: valueOfWethHeld + valueOfWbtcHeld
-        });
+    function _checkDSCData() internal view returns (uint256 protocolAccumulatedHoldings) {
+        // Caching length into uint8 based on domain assumption that collateral list will not exceed 255 tokens
+        uint8 len = uint8(s_TOKEN_ADDRESSES.length);
+        
+        for (uint256 i = 0; i < len;) {
+            address token = getTokenAddress(i);
+            address priceFeed = getPriceFeed(token);
+            uint256 balanceHeld = IERC20(token).balanceOf(address(this));
+            uint256 balanceCollateralValue = getCollateralValue(priceFeed, balanceHeld);
+            
+            // Standard addition (checked by default)
+            protocolAccumulatedHoldings += balanceCollateralValue;
+
+            // CORRECT UNCHECKED INCREMENT (Gas Optimization)
+            unchecked {
+                i++;
+            }
+        }
     }
 
     /**
@@ -572,8 +587,8 @@ contract DSCEngine {
     /**
      * @notice Determines the human-readable and encoded health status based on the health factor.
      * @param _userInfo The health factor (scaled to 1e18).
-     * @return encoded Encoded status using keccak256.
-     * @return status Human-readable status: "Good!!!", "Warning!!!", or "Risk!!!".
+     * @return encoded Encoded status using keccak256 for gas-efficient comparison.
+     * @return status Human-readable status: "Good!!!" (>= 150%), "Warning!!!" (120% to 150%), or "Risk!!!" (< 120%).
      */
     function _getHealthStatus(uint256 _userInfo) internal pure returns (bytes32 encoded, string memory status) {
         if (_userInfo >= s_MAX_THRESHOLD) {
@@ -582,7 +597,8 @@ contract DSCEngine {
         } else if (_userInfo < s_MAX_THRESHOLD && _userInfo >= s_MIN_THRESHOLD) {
             bytes32 encodedWarning = _statusString("Warning!!!");
             return (encodedWarning, "Warning!!!");
-        } else { // _userInfo < s_MIN_THRESHOLD
+        } else {
+            // _userInfo < s_MIN_THRESHOLD
             bytes32 encodedRisk = _statusString("Risk!!!");
             return (encodedRisk, "Risk!!!");
         }
