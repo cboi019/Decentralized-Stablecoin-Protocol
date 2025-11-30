@@ -17,7 +17,6 @@ import {AggregatorV3Interface} from "@chainlink/contracts/src/v0.8/shared/interf
  * Key Features:
  * - Collateral-Specific Debt: Debt is mapped to the specific collateral used, avoiding cross-collateral risk.
  * - Dual Health Checks: Every risky transaction (mint/withdraw) checks both the user's position health (>150%) and the protocol's global solvency.
- * - Global Solvency Invariant: Total DSC supply is capped at 80% of the total USD value of all deposited collateral, ensuring a minimum 125% global collateralization ratio.
  * - Liquidation: Positions below 150% collateralization are eligible for liquidation, with a 120-150% grace zone preventing instant liquidation.
  */
 contract DSCEngine {
@@ -164,7 +163,7 @@ contract DSCEngine {
      * @param _dscAddress Address of the DefiStableCoin contract.
      * @dev Token addresses and price feed addresses must be in the same order and length.
      */
-    constructor(address[] memory _tokenAddresses, address[] memory _priceFeedAddresses, address _dscAddress) {
+    constructor(address[2] memory _tokenAddresses, address[2] memory _priceFeedAddresses, address _dscAddress) {
         if (_priceFeedAddresses.length != _tokenAddresses.length) {
             revert DSCEngine__TOKEN_ADDRESSES_AND_PRICE_FEED_ADDRESSES_MUST_BE_SAME_LENGTH();
         }
@@ -472,7 +471,6 @@ contract DSCEngine {
      * @param _tokenAmount Amount of collateral being withdrawn (0 if minting).
      * @param _DSCAmount Amount of DSC being minted (0 if withdrawing).
      * @dev Enforces the global invariant: Total Collateral Value (USD) >= 125% * Total DSC Supply.
-     * @dev This is achieved by capping total DSC supply at 80% (s_PROTOCOL_COLLATERAL_CAP) of the protocol's total collateral value.
      */
     function _checkProtocolHealth(address _tokenAddress, uint256 _tokenAmount, uint256 _DSCAmount) internal view {
         uint256 totalDscSupply = i_DSC.totalSupply();
@@ -497,11 +495,7 @@ contract DSCEngine {
             accumulatedHoldingsAfterTx = protocolAccumulatedHoldings;
         }
 
-        // Calculate the maximum allowed DSC supply based on the remaining collateral value (80% of holdings).
-        // Max DSC Allowed = (Total Collateral Value * 80) / 100
-        uint256 holdingsCap = (accumulatedHoldingsAfterTx * s_PROTOCOL_COLLATERAL_CAP) / 100;
-
-        if (totalDSCAfterTX > holdingsCap) {
+        if (totalDSCAfterTX > accumulatedHoldingsAfterTx) {
             revert DSCEngine__PROTOCOLS_HEALTH_AT_RISK();
         }
     }
