@@ -73,10 +73,6 @@ contract DSCEngine {
     /// @notice Divisor for calculating the maximum allowed debt burn during liquidation (2 for 50%).
     uint256 private constant s_HALF_OF_DEBTORS_BALANCE = 2;
 
-    /// @notice Maximum percentage of protocol collateral value that DSC supply can consume (80).
-    /// @dev This enforces a minimum 125% global collateralization ratio (100 / 80 = 1.25).
-    uint256 private constant s_PROTOCOL_COLLATERAL_CAP = 80;
-
     /// @notice Tracks which tokens are allowed as collateral.
     mapping(address tokenAddreses => bool) private isAllowed;
 
@@ -299,9 +295,6 @@ contract DSCEngine {
         // Calculate user health factor if this new debt is added
         (uint256 userInfo,) = _getHealth(_tokenCollateral, msg.sender, _amount);
 
-        // Check if protocol will remain solvent after minting (Total Collateral Value >= 125% * Total DSC Supply)
-        _checkProtocolHealth(_tokenCollateral, 0, _amount);
-
         // Revert if the user's health factor after minting is below the minimum threshold
         _revertAfterUserHealthCheck(userInfo, "");
 
@@ -309,6 +302,9 @@ contract DSCEngine {
         s_TOKEN_TO_MINTED_DSC[msg.sender][_tokenCollateral] += _amount;
         emit mintedDSC(msg.sender, _amount);
         i_DSC.mint(msg.sender, _amount);
+
+        // Check if protocol will remain solvent after minting (Total Collateral Value >= 125% * Total DSC Supply)
+        _checkProtocolHealth();
     }
 
     /**
@@ -356,9 +352,6 @@ contract DSCEngine {
             revert DSCEngine__INSUFFICIENT_BALANCE(_amount);
         }
 
-        // Check if withdrawal will break protocol health (Total Collateral Value >= 125% * Total DSC Supply)
-        _checkProtocolHealth(_tokenAddress, _amount, 0);
-
         (uint256 totalDSCMinted, uint256 totalCollateralValue) = getUserAccountInfo(_tokenAddress, msg.sender);
 
         if (totalDSCMinted > 0) {
@@ -382,6 +375,9 @@ contract DSCEngine {
         if (!success) {
             revert DSCEngine__TRANSACTION_FAILED();
         }
+
+        // Check if withdrawal will break protocol health (Total Collateral Value >= 125% * Total DSC Supply)
+        _checkProtocolHealth();
     }
 
     /**
@@ -466,36 +462,14 @@ contract DSCEngine {
     //////////////////////////////////////////////////////////////*/
 
     /**
-     * @notice Validates protocol-level health before allowing minting or withdrawal.
-     * @param _tokenAddress The collateral token involved in the transaction.
-     * @param _tokenAmount Amount of collateral being withdrawn (0 if minting).
-     * @param _DSCAmount Amount of DSC being minted (0 if withdrawing).
+     * @notice Validates protocol-level health.
      * @dev Enforces the global invariant: Total Collateral Value (USD) >= 125% * Total DSC Supply.
      */
-    function _checkProtocolHealth(address _tokenAddress, uint256 _tokenAmount, uint256 _DSCAmount) internal view {
+    function _checkProtocolHealth() internal view {
         uint256 totalDscSupply = i_DSC.totalSupply();
         uint256 protocolAccumulatedHoldings = _checkDSCData();
 
-        uint256 totalDSCAfterTX;
-        uint256 accumulatedHoldingsAfterTx;
-        
-        if (_DSCAmount > 0) {
-            // Simulating minting scenario
-            totalDSCAfterTX = totalDscSupply + _DSCAmount;
-            accumulatedHoldingsAfterTx = protocolAccumulatedHoldings; // Holdings don't change on mint
-        } else if (_tokenAmount > 0) {
-            // Simulating withdrawal scenario
-            uint256 valueOfTokenToRedeem = getCollateralValue(getPriceFeed(_tokenAddress), _tokenAmount);
-            // This subtraction is safe because the user already checked they have enough collateral
-            accumulatedHoldingsAfterTx = protocolAccumulatedHoldings - valueOfTokenToRedeem; 
-            totalDSCAfterTX = totalDscSupply; // Supply doesn't change on withdraw
-        } else {
-            // Default to current state if no change is simulated
-            totalDSCAfterTX = totalDscSupply;
-            accumulatedHoldingsAfterTx = protocolAccumulatedHoldings;
-        }
-
-        if (totalDSCAfterTX > accumulatedHoldingsAfterTx) {
+        if (totalDscSupply >= protocolAccumulatedHoldings) {
             revert DSCEngine__PROTOCOLS_HEALTH_AT_RISK();
         }
     }
