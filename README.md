@@ -100,7 +100,7 @@ dscEngine.redeemCollateralWithDSC(wethAddress, 1 ether, 1000e18);
 
 ## Test Results
 
-**Unit Tests**: 24/24 passing
+**Unit Tests**: 19/19 passing
 **Invariant Tests**: 4/4 passing (12,800 calls, 0 reverts)
 ![alt text](image.png)
 ![alt text](image-1.png)

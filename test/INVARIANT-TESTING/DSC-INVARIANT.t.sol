@@ -9,6 +9,7 @@ import {deployDSC} from "../../script/DEFI-STABLECOIN.s.sol";
 import {HelperConfig} from "../../script/DSC_HELPER-CONFIG.s.sol";
 import {ERC20Mock} from "@openzeppelin/contracts/mocks/token/ERC20Mock.sol";
 import {dscHandler} from "./HANDLER.t.sol";
+import {engineLibrary} from "../../src/DSCLIB.sol";
 
 /* INVARIANT:
       - Total value of Collateral Deposited must be greater than Total DSC Minted
@@ -50,8 +51,8 @@ contract dscInvariantTest is StdInvariant, Test {
         uint256 totalWbtcDeposited = ERC20Mock(config.wbtc).balanceOf(address(dscEngine));
         uint256 totalDscSupply = dsc.totalSupply();
 
-        uint256 wethValue = dscEngine.getCollateralValue(config.wethUsdPriceFeed, totalWethDeposited);
-        uint256 wbtcValue = dscEngine.getCollateralValue(config.wbtcUsdPriceFeed, totalWbtcDeposited);
+        (uint256 wethValue,) = engineLibrary._getCollateralValue(config.wethUsdPriceFeed, totalWethDeposited);
+        (uint256 wbtcValue,) = engineLibrary._getCollateralValue(config.wbtcUsdPriceFeed, totalWbtcDeposited);
 
         console.log(wethValue);
         console.log(wbtcValue);
@@ -62,11 +63,13 @@ contract dscInvariantTest is StdInvariant, Test {
 
     function invariant_TOTAL_DSC_OF_ALL_USERS_IS_EQUAL_TO_THE_TOTAL_DSC_SUPPLY() public view {
         uint256 totalUserDSC;
-        uint256 usersCount = dscEngine.getUsersCount();
+        uint256 usersCount = handler.getUsersCount();
         for (uint256 i = 0; i < usersCount; i++) {
-            address user = dscEngine.getUsers(i);
-            uint256 getDSCBalance = dscEngine.getUserMintedDscBalance(user);
-            totalUserDSC += getDSCBalance;
+            address user = handler.getUsers(i);
+            uint256 getWethDSCBalance = dscEngine.getTokenToMintedDSC(user, config.weth);
+            uint256 getWbtcDSCBalance = dscEngine.getTokenToMintedDSC(user, config.wbtc);
+            uint256 total = getWethDSCBalance + getWbtcDSCBalance;
+            totalUserDSC += total;
         }
 
         uint256 totalSupply = dsc.totalSupply();
@@ -85,14 +88,13 @@ contract dscInvariantTest is StdInvariant, Test {
         dscEngine.getTokenAddress(0);
         dscEngine.getTokenAddress(1);
 
-        uint256 usersCount = dscEngine.getUsersCount();
+        uint256 usersCount = handler.getUsersCount();
         for (uint256 i = 0; i < usersCount; i++) {
-            address users = dscEngine.getUsers(i);
+            address users = handler.getUsers(i);
             dscEngine.getUserCollateralBalance(users, dscEngine.getTokenAddress(0));
             dscEngine.getUserCollateralBalance(users, dscEngine.getTokenAddress(1));
-            dscEngine.getUserMintedDscBalance(users);
-            dscEngine.getTokenToMintedDSC(users, config.weth);
-            dscEngine.getTokenToMintedDSC(users, config.wbtc);
+            dscEngine.getTokenToMintedDSC(users, dscEngine.getTokenAddress(0));
+            dscEngine.getTokenToMintedDSC(users, dscEngine.getTokenAddress(1));
         }
 
         dscEngine.getDSCAddress();

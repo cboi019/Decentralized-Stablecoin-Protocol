@@ -8,6 +8,7 @@ import {deployDSC} from "../script/DEFI-STABLECOIN.s.sol";
 import {HelperConfig} from "../script/DSC_HELPER-CONFIG.s.sol";
 import {Test, console} from "forge-std/Test.sol";
 import {ERC20Mock} from "@openzeppelin/contracts/mocks/token/ERC20Mock.sol";
+import {engineLibrary} from "../src/DSCLIB.sol";
 import {Vm} from "forge-std/Vm.sol";
 
 contract testDSCEngine is Test {
@@ -96,7 +97,7 @@ contract testDSCEngine is Test {
 
     function test_PRICE_FEED_ACCURACY() public view {
         uint256 amount = 5e17;
-        uint256 actualOutput = dscEngine.getCollateralValue(config.wethUsdPriceFeed, amount);
+        (uint256 actualOutput,) = engineLibrary._getCollateralValue(config.wethUsdPriceFeed, amount);
         uint256 expectedOutput = 1700e18;
 
         assertEq(actualOutput, expectedOutput);
@@ -109,34 +110,17 @@ contract testDSCEngine is Test {
         assertEq(totalCollateralValue, 1.7e22);
     }
 
-    function test_CHECK_HEALTH_STATUS() public userDepositsCollateral {
-        // IF GOOD
-        (, string memory status1) = dscEngine.getHealth(config.weth, user1, HEALTH_GOOD_AMOUNT);
-        assertEq(keccak256(bytes(status1)), keccak256(bytes("Good!!!")));
-        console.log(status1);
-
-        // IF WARNING
-        (, string memory status2) = dscEngine.getHealth(config.weth, user1, HEALTH_WARNING_AMOUNT);
-        assertEq(keccak256(bytes(status2)), keccak256(bytes("Warning!!!")));
-        console.log(status2);
-
-        // IF RISK
-        (, string memory status3) = dscEngine.getHealth(config.weth, user1, HEALTH_RISK_AMOUNT);
-        assertEq(keccak256(bytes(status3)), keccak256(bytes("Risk!!!")));
-        console.log(status3);
-    }
-
     function test_MINT_REVERT() public userDepositsCollateral {
         // IF RISK
         vm.prank(user1);
-        vm.expectRevert(DSCEngine.DSCEngine__PROTOCOLS_HEALTH_AT_RISK.selector);
+        vm.expectRevert(DSCEngine.DSCEngine__HEALTH_AT_RISK.selector);
         dscEngine.mintDSC(config.weth, HEALTH_RISK_AMOUNT);
 
         // IF GOOD
         vm.prank(user1);
         dscEngine.mintDSC(config.weth, HEALTH_GOOD_AMOUNT);
 
-        uint256 balance = dscEngine.getUserMintedDscBalance(user1);
+        uint256 balance = dscEngine.getTokenToMintedDSC(user1, config.weth);
         assertEq(balance, HEALTH_GOOD_AMOUNT);
     }
 
@@ -156,7 +140,7 @@ contract testDSCEngine is Test {
         MockV3Aggregator(config.wethUsdPriceFeed).updateAnswer(1000e8);
 
         vm.prank(user1);
-        vm.expectRevert(DSCEngine.DSCEngine__PROTOCOLS_HEALTH_AT_RISK.selector);
+        vm.expectRevert(DSCEngine.DSCEngine__HEALTH_AT_RISK.selector);
         dscEngine.redeemCollateral(config.weth, amountToWithdraw);
     }
 
@@ -172,17 +156,17 @@ contract testDSCEngine is Test {
         vm.expectRevert(DSCEngine.DSCEngine__INPUT_AN_AMOUNT.selector);
         dscEngine.burnDSC(0, config.weth);
 
-        uint256 userDscBalance = dscEngine.getUserMintedDscBalance(user1);
+        uint256 userDscBalance = dscEngine.getTokenToMintedDSC(user1, config.weth);
         vm.assume(_amount > userDscBalance);
         vm.prank(user1);
         vm.expectRevert(abi.encodeWithSelector(DSCEngine.DSCEngine__INSUFFICIENT_BALANCE.selector, _amount));
         dscEngine.burnDSC(_amount, config.weth);
 
-        uint256 previousBalance = dscEngine.getUserMintedDscBalance(user1);
+        uint256 previousBalance = dscEngine.getTokenToMintedDSC(user1, config.weth);
         vm.prank(user1);
         dscEngine.burnDSC(amountToBurn, config.weth);
         uint256 newBalance = previousBalance - amountToBurn;
-        uint256 expectedBalance = dscEngine.getUserMintedDscBalance(user1);
+        uint256 expectedBalance = dscEngine.getTokenToMintedDSC(user1, config.weth);
 
         assertEq(expectedBalance, newBalance);
     }
@@ -204,7 +188,7 @@ contract testDSCEngine is Test {
         vm.startPrank(user1);
         ERC20Mock(config.weth).approve(address(dscEngine), DEPOSIT_AMOUNT);
         dscEngine.depositCollateralForDSC(config.weth, DEPOSIT_AMOUNT, DSC_AMOUNT_TO_MINT);
-        uint256 dscBalance = dscEngine.getUserMintedDscBalance(user1);
+        uint256 dscBalance = dscEngine.getTokenToMintedDSC(user1, config.weth);
 
         vm.assume(_amount > dscBalance);
         vm.expectRevert(abi.encodeWithSelector(DSCEngine.DSCEngine__INSUFFICIENT_BALANCE.selector, _amount));
@@ -230,9 +214,9 @@ contract testDSCEngine is Test {
         dscEngine.mintDSC(config.weth, DSC_AMOUNT_TO_MINT);
         vm.stopPrank();
 
-        uint256 healthStatus = dscEngine.getHealthStatusForLiquidation(config.weth, user1);
-        uint256 amountToBurn = dscEngine.getUserMintedDscBalance(user1) / 2;
-        vm.expectRevert(abi.encodeWithSelector(DSCEngine.DSCEngine__HEALTH_IS_GOOD.selector, healthStatus));
+        // (uint256 healthStatus, ) = dscEngine.getUsersHealthStatus(config.weth, user1);
+        uint256 amountToBurn = dscEngine.getTokenToMintedDSC(user1, config.weth) / 2;
+        vm.expectRevert(abi.encodeWithSelector(DSCEngine.DSCEngine__HEALTH_IS_GOOD.selector));
         vm.prank(liquidator);
         dscEngine.liquidate(config.weth, user1, amountToBurn);
     }
@@ -250,9 +234,9 @@ contract testDSCEngine is Test {
 
         MockV3Aggregator(config.wethUsdPriceFeed).updateAnswer(1354e8);
 
-        uint256 healthStatus = dscEngine.getHealthStatusForLiquidation(config.weth, user1);
-        uint256 amountToBurn = dscEngine.getUserMintedDscBalance(user1) / 2;
-        vm.expectRevert(abi.encodeWithSelector(DSCEngine.DSCEngine__HEALTH_AT_GRACE_ZONE.selector, healthStatus));
+        // (uint256 healthStatus, ) = dscEngine.getUsersHealthStatus(config.weth, user1);
+        uint256 amountToBurn = dscEngine.getTokenToMintedDSC(user1, config.weth) / 2;
+        vm.expectRevert(abi.encodeWithSelector(DSCEngine.DSCEngine__HEALTH_AT_GRACE_ZONE.selector));
         vm.prank(liquidator);
         dscEngine.liquidate(config.weth, user1, amountToBurn);
     }
@@ -269,7 +253,7 @@ contract testDSCEngine is Test {
 
         MockV3Aggregator(config.wethUsdPriceFeed).updateAnswer(1180e8);
 
-        uint256 amountToBurn = dscEngine.getUserMintedDscBalance(user1);
+        uint256 amountToBurn = dscEngine.getTokenToMintedDSC(user1, config.weth);
         vm.assume(_amount != amountToBurn / 2 && _amount > amountToBurn / 2);
         vm.expectRevert(DSCEngine.DSCEngine__CANNOT_BURN_MORE_THAN_HALF_OF_DEBT.selector);
         vm.prank(liquidator);
@@ -288,26 +272,23 @@ contract testDSCEngine is Test {
         vm.stopPrank();
 
         MockV3Aggregator(config.wethUsdPriceFeed).updateAnswer(1180e8);
-        uint256 status1 = dscEngine.getHealthStatusForLiquidation(config.weth, user1);
+        (, string memory status1) = dscEngine.getUsersHealthStatus(config.weth, user1);
         console.log(status1);
 
-        uint256 amountToBurn = dscEngine.getUserMintedDscBalance(user1) / 2;
+        uint256 amountToBurn = dscEngine.getTokenToMintedDSC(user1, config.weth) / 2;
         uint256 previousDebtorEthBalance = dscEngine.getUserCollateralBalance(user1, config.weth);
-        uint256 previousDebtorDSCBalance = dscEngine.getUserMintedDscBalance(user1);
+        uint256 previousDebtorDSCBalance = dscEngine.getTokenToMintedDSC(user1, config.weth);
         uint256 previousLiquidatorDSCBalance = ERC20Mock(address(dsc)).balanceOf(liquidator);
         vm.prank(liquidator);
         dscEngine.liquidate(config.weth, user1, amountToBurn);
 
         uint256 newDebtorEthBalance = dscEngine.getUserCollateralBalance(user1, config.weth);
-        uint256 newDebtorDSCBalance = dscEngine.getUserMintedDscBalance(user1);
+        uint256 newDebtorDSCBalance = dscEngine.getTokenToMintedDSC(user1, config.weth);
         uint256 newLiquidatorDSCBalance = ERC20Mock(address(dsc)).balanceOf(liquidator);
 
         assert(newDebtorEthBalance < previousDebtorEthBalance);
         assert(newDebtorDSCBalance < previousDebtorDSCBalance);
         assert(newLiquidatorDSCBalance < previousLiquidatorDSCBalance);
-
-        uint256 status = dscEngine.getHealthStatusForLiquidation(config.weth, user1);
-        console.log(status);
     }
 
     function test_LIQUIDTION_REVERTS_IF_HEALTH_OF_LIQUIDATOR_WILL_BE_AT_RISK() public userDepositsCollateral {
@@ -323,13 +304,13 @@ contract testDSCEngine is Test {
 
         MockV3Aggregator(config.wethUsdPriceFeed).updateAnswer(1180e8);
 
-        uint256 amountToBurn = dscEngine.getUserMintedDscBalance(user1) / 2;
+        uint256 amountToBurn = dscEngine.getTokenToMintedDSC(user1, config.weth) / 2;
         vm.prank(liquidator);
         vm.expectRevert(DSCEngine.DSCEngine__HEALTH_AT_RISK.selector);
         dscEngine.liquidate(config.weth, user1, amountToBurn);
 
         uint256 newDebtorEthBalance = dscEngine.getUserCollateralBalance(user1, config.weth);
-        uint256 newDebtorDSCBalance = dscEngine.getUserMintedDscBalance(user1);
+        uint256 newDebtorDSCBalance = dscEngine.getTokenToMintedDSC(user1, config.weth);
         uint256 newLiquidatorDSCBalance = ERC20Mock(address(dsc)).balanceOf(liquidator);
         console.log(newDebtorDSCBalance);
         console.log(newDebtorEthBalance);
