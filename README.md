@@ -1,48 +1,144 @@
-# Decentralized Stablecoin (DSC) Protocol
+Decentralized Stablecoin Protocol (DSC)
 
-An overcollateralized stablecoin system with novel collateral-specific debt tracking and dual-layer health checks to prevent protocol insolvency.
+The Decentralized Stablecoin Protocol (DSC) is a Solidity-based DeFi primitive designed to mint a USD-pegged stablecoin (DSC) against over-collateralized cryptocurrency assets (WETH, WBTC, etc.).
 
-## Overview
+This implementation focuses on safety, solvency, and a novel collateral-specific debt tracking mechanism, ensuring that the health of a user's position is managed granularly per asset, thereby preventing catastrophic cross-collateral contagion.
 
-This protocol implements a decentralized stablecoin (DSC) backed by WETH and WBTC collateral. Unlike traditional stablecoin systems, DSC allocates minted tokens to specific collateral types, preventing cross-collateral insolvency attacks.
+⚙️ Architecture
 
-## Key Innovations
+The protocol is split into two core components:
 
-### 1. Collateral-Specific Debt Allocation
-- DSC minted against WETH is tracked separately from DSC minted against WBTC
-- Prevents scenarios where users drain one collateral type while over-minting against another
-- Maintains protocol solvency even during volatile market conditions
+DSCEngine.sol (Contract): The central hub. It manages user state (collateral balances, DSC debt), handles token transfers, enforces security checks, and exposes all external functions (deposit, mint, liquidate).
 
-### 2. Dual Health Check System
-- **User-Level Health**: Ensures individual positions remain overcollateralized (>150%)
-- **Protocol-Level Health**: Validates total collateral value >= total DSC supply before any transaction
-- **Forward-Looking Validation**: Checks if health will break AFTER transaction executes
+engineLibrary.sol (Library - Aliased as DSCLIB.sol): Contains all the pure and gas-efficient calculation logic. This includes fetching Chainlink prices, calculating the total USD value of collateral, and determining a user's health status ("Good!!!", "Warning!!!", "Risk!!!").
 
-### 3. Grace Period Liquidation
-- Health > 150%: Safe zone, no liquidation
-- Health 120-150%: Warning zone (grace period), liquidation not allowed
-- Health < 120%: Liquidation zone, eligible for partial liquidation
-- Maximum 50% of debt can be liquidated per transaction
+🔒 Solvency and Health Mechanics
 
-### 4. Advanced Invariant Testing
-- Weighted randomization (25% liquidation, 50% deposits, 15% mints, 20% redeems, 15% price changes)
-- Bounded fuzzing with realistic price ranges (ETH: $1500-3400, BTC: $15554-20000)
-- 12,800+ function calls with 0 reverts in testing
+The protocol enforces a dual-layered health check system to maintain over-collateralization at both the individual user and the global protocol level.
 
-## Technical Architecture
+1. User Position Health
 
-### Core Contracts
+Each user's debt is mapped per collateral token. For example, debt minted against WETH is separate from debt minted against WBTC, allowing for precise risk management.
 
-**DSCEngine.sol** - Main protocol logic
-- Handles deposits, withdrawals, minting, burning, liquidations
-- Implements dual health check system
-- Integrates with Chainlink oracles
+Minimum Collateralization Ratio (MCR): 150%
 
-**DEFI-STABLECOIN.sol** - ERC20 stablecoin token
-- Mintable/burnable by DSCEngine only
+Risky Operations (Mint/Withdraw): Any action that would push a user's collateralization below 150% (Health Factor $\le 1.5$) will revert. Users must maintain $\ge 150\%$ collateralization to perform standard operations.
 
-**ORACLE-LIB.sol** - Oracle wrapper with staleness checks
-- Validates Chainlink price feed freshness
+Liquidation Threshold: 120%
+
+Grace Zone (120% to 150%): A user is considered in the Warning!!! zone. They cannot withdraw collateral but are not yet eligible for liquidation.
+
+Liquidation Zone ($< 120\%$): If the health factor drops below 120% (Health Factor $< 1.2$), the position enters the Risk!!! zone and is eligible for liquidation.
+
+$$\text{Health Factor} = \frac{\text{Total Collateral Value (USD)}}{\text{Total DSC Debt}}$$
+
+2. Protocol Global Health
+
+The entire system's solvency is checked after every major transaction (mint or collateral redeem) to prevent a global deficit.
+
+Global Solvency Threshold: The total USD value of all collateral held by the protocol must be greater than $125\%$ of the total outstanding DSC supply.
+
+💰 Liquidation Process
+
+Liquidation is an external function designed to incentivize liquidators to resolve under-collateralized positions:
+
+Eligibility: The debtor's health factor must be in the Risk!!! zone ($< 120\%$).
+
+Repayment: The liquidator burns DSC to repay a portion of the debtor's debt.
+
+Maximum Burn: A liquidator is restricted to burning $\le 50\%$ of the debtor's debt per collateral token in a single transaction, ensuring decentralized liquidation and preventing one-shot full takeovers.
+
+Incentive: The liquidator is rewarded with the debtor's collateral plus a $10\%$ bonus on the seized value.
+
+$$\text{Collateral Seized} = \left(\frac{\text{DSC Burned}}{\text{Collateral Price}}\right) \times 1.10$$
+
+🔑 External Functions
+
+Deposit and Mint
+
+Function
+
+Description
+
+Pre-Check
+
+Post-Check
+
+depositCollateral(address token, uint256 amount)
+
+Deposits collateral tokens.
+
+onlyAllowedAddress, noneZero
+
+None (safe operation).
+
+mintDSC(address token, uint256 amount)
+
+Mints DSC debt against a specific collateral.
+
+noneZero
+
+User Health $\ge 150\%$
+
+depositCollateralForDSC(...)
+
+Atomic deposit + mint.
+
+(Combines checks)
+
+User Health $\ge 150\%$ & Protocol Health
+
+Redeem and Repay
+
+Function
+
+Description
+
+Pre-Check
+
+Post-Check
+
+burnDSC(uint256 amount, address token)
+
+Repays debt (burns DSC) against a specific collateral.
+
+noneZero, sufficient debt
+
+None (improves health).
+
+redeemCollateral(address token, uint256 amount)
+
+Withdraws deposited collateral.
+
+noneZero, sufficient balance
+
+Current User Health $\ge 150\%$ and Future User Health $\ge 150\%$.
+
+redeemCollateralWithDSC(...)
+
+Atomic burn + redeem.
+
+(Combines checks)
+
+Current User Health $\ge 150\%$ and Future User Health $\ge 150\%$.
+
+Liquidation
+
+Function
+
+Description
+
+Check
+
+Result
+
+liquidate(address token, address debtor, uint256 dscToBurn)
+
+Liquidates a risky position.
+
+Debtor Health $< 120\%$, Burn $\le 50\%$ of debt.
+
+Collateral + 10% bonus transferred to liquidator; Debtor debt/collateral reduced.
 
 ### Security Features
 
@@ -51,7 +147,7 @@ This protocol implements a decentralized stablecoin (DSC) backed by WETH and WBT
 ✅ Forward-Looking Validation
 ✅ Protocol Insolvency Prevention
 ✅ Liquidation Safeguards
-✅ Comprehensive Testing (24 unit + 4 invariant tests)
+✅ Comprehensive Testing (19 unit + 4 invariant tests)
 
 ## Installation
 ```bash
@@ -100,10 +196,12 @@ dscEngine.redeemCollateralWithDSC(wethAddress, 1 ether, 1000e18);
 
 ## Test Results
 
+<<<<<<< HEAD
 **Unit Tests**: 19/19 passing
+=======
+**Unit Tests**: 20/20 passing
+>>>>>>> 384f15a69b6364b09ca1da93ad5724330a5f3d67
 **Invariant Tests**: 4/4 passing (12,800 calls, 0 reverts)
-![alt text](image.png)
-![alt text](image-1.png)
 
 ### Key Invariants Proven
 1. Total collateral value >= Total DSC supply (always)
